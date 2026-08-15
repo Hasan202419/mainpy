@@ -1,0 +1,311 @@
+// This Pine Script® code is subject to the terms of the Mozilla Public License 2.0 at https://mozilla.org/MPL/2.0/
+// © Hasan202419
+//
+// archetype_orb_vwap_strategy.pine
+// =================================
+// Direct Pine Script port of this repo's Python paper-trading engine
+// (archetypes.py + scanner.py + portfolio.py), which itself is derived
+// from the 2026-08-14 Model Council synthesis (Claude Opus 5 / Claude
+// Fable 5 "29-stock intraday playbook" reports). Unlike
+// buy_only_strategy.pine (a separate, unrelated long-only script from a
+// different report), THIS script trades BOTH long and short, exactly like
+// the source Python scanner.
+//
+// What it does
+// ------------
+// Apply this to a chart for any of the 29 tickers classified in
+// archetypes.py. It looks up that ticker's archetype group (A-G) and
+// automatically uses that group's stop_k / target_r risk parameters, then
+// runs the same two setups as scanner.py, in the same priority order:
+//
+//   1. ORB (Opening Range Breakout) -- first N bars of the session
+//      (default 6, i.e. 30 minutes on a 5m chart) define the opening
+//      range; a close outside that range signals long (above) or short
+//      (below).
+//   2. VWAP reclaim -- price closes back on the other side of the
+//      session VWAP after trading on the opposite side (checked only if
+//      ORB did not fire).
+//
+// Risk management mirrors portfolio.py:
+//   - ATR-proxy (simple average of bar ranges, NOT Wilder's ATR -- same
+//     formula as scanner.py's _atr_proxy) sizes the stop distance via the
+//     group's stop_k.
+//   - Position size is computed so each trade risks a fixed % of equity
+//     (DEFAULT_RISK_PCT in portfolio.py -> 0.25% here).
+//   - Target is stop-distance * the group's target_r (R-multiple).
+//   - New entries are blocked once the daily loss limit (2%) or the
+//     max drawdown from starting balance (4%) is hit -- same as
+//     portfolio.py's can_open() gate. An already-open position is left to
+//     hit its own stop/target; it is not force-closed.
+//
+// What it does NOT do
+// --------------------
+// archetypes.py also caps how many positions may be open AT THE SAME TIME
+// across an entire correlation group (max_concurrent) -- e.g. only one of
+// TSLA/AMD/MU/NVDA/AVGO (group A) at once. A single Pine strategy only
+// ever sees the one ticker it's applied to, so it CANNOT enforce that
+// cross-ticker cap. The group's max_concurrent value is shown in the info
+// table for reference only. If you trade multiple of these tickers at
+// once, you are responsible for the correlation-risk limit yourself.
+
+//@version=6
+strategy(
+     title="Archetype ORB + VWAP Reclaim (29-Stock Playbook)",
+     shorttitle="Archetype-ORB-VWAP",
+     overlay=true,
+     initial_capital=30000,
+     default_qty_type=strategy.fixed,
+     default_qty_value=1,
+     currency=currency.USD,
+     calc_on_order_fills=false,
+     process_orders_on_close=false)
+
+// --------------------------------------------------------------------- //
+// Inputs
+// --------------------------------------------------------------------- //
+openingRangeBars = input.int(6, title="Opening Range Bars (5m chart: 6 = 30 min)", minval=1, group="ORB")
+
+useGroupDefaults = input.bool(true, title="Use archetype group's stop_k / target_r", group="Archetype Group")
+manualStopK      = input.float(0.50, title="Manual stop_k (used if above is off, or ticker unclassified)", minval=0.01, group="Archetype Group")
+manualTargetR    = input.float(2.00, title="Manual target_r (used if above is off, or ticker unclassified)", minval=0.10, group="Archetype Group")
+
+atrLookback           = input.int(14, title="ATR-proxy lookback (bars)", minval=1, group="Risk Management")
+riskPerTradePctInput  = input.float(0.25, title="Risk per Trade (% of equity)", minval=0.01, group="Risk Management")
+dailyLossLimitPctInput = input.float(2.0, title="Daily Loss Limit (%)", minval=0.1, group="Risk Management")
+maxDrawdownPctInput    = input.float(4.0, title="Max Drawdown from Starting Balance (%)", minval=0.1, group="Risk Management")
+startingBalanceInput   = input.float(30000, title="Starting Balance ($) -- keep in sync with initial_capital above", group="Risk Management")
+
+riskPerTradePct     = riskPerTradePctInput / 100
+dailyLossLimitPct   = dailyLossLimitPctInput / 100
+maxDrawdownPct       = maxDrawdownPctInput / 100
+
+// --------------------------------------------------------------------- //
+// Archetype classification -- ported verbatim from archetypes.py's
+// TICKER_TO_GROUP / ARCHETYPES.
+// --------------------------------------------------------------------- //
+tickerGroup() =>
+    switch syminfo.ticker
+        "TSLA" => "A"
+        "AMD"  => "A"
+        "MU"   => "A"
+        "NVDA" => "A"
+        "AVGO" => "A"
+        "TSM"  => "B"
+        "ASML" => "B"
+        "QCOM" => "B"
+        "TXN"  => "B"
+        "ORCL" => "B"
+        "NET"  => "C"
+        "ZS"   => "C"
+        "CRWD" => "C"
+        "FTNT" => "C"
+        "ABNB" => "C"
+        "AAPL" => "D"
+        "MSFT" => "D"
+        "AMZN" => "D"
+        "CRM"  => "E"
+        "ADBE" => "E"
+        "LLY"  => "E"
+        "NKE"  => "E"
+        "BABA" => "F"
+        "NVO"  => "F"
+        "JNJ"  => "G"
+        "XOM"  => "G"
+        "MDT"  => "G"
+        "V"    => "G"
+        "MA"   => "G"
+        => "NONE"
+
+group        = tickerGroup()
+isClassified = group != "NONE"
+
+groupName() =>
+    switch group
+        "A" => "Mega-beta semis/EV"
+        "B" => "AI/infra proxy"
+        "C" => "Thin high-vol software"
+        "D" => "Mega-cap movers"
+        "E" => "Idiosyncratic large-cap"
+        "F" => "ADR / foreign listing"
+        "G" => "True defensive"
+        => "Unclassified"
+
+defaultStopK() =>
+    switch group
+        "A" => 0.50
+        "B" => 0.45
+        "C" => 0.50
+        "D" => 0.30
+        "E" => 0.40
+        "F" => 0.45
+        "G" => 0.25
+        => float(na)
+
+defaultTargetR() =>
+    switch group
+        "A" => 2.0
+        "B" => 1.8
+        "C" => 1.5
+        "D" => 1.6
+        "E" => 2.5
+        "F" => 1.8
+        "G" => 1.5
+        => float(na)
+
+groupMaxConcurrent() =>
+    switch group
+        "A" => 1
+        "B" => 1
+        "C" => 1
+        "D" => 1
+        "E" => 2
+        "F" => 1
+        "G" => 1
+        => 0
+
+groupStopKVal   = defaultStopK()
+groupTargetRVal = defaultTargetR()
+stopK   = useGroupDefaults and not na(groupStopKVal)   ? groupStopKVal   : manualStopK
+targetR = useGroupDefaults and not na(groupTargetRVal) ? groupTargetRVal : manualTargetR
+
+// --------------------------------------------------------------------- //
+// Opening range (resets each session) -- same window scanner.py's
+// check_orb() uses (first `openingRangeBars` bars).
+// --------------------------------------------------------------------- //
+var int   barsIntoSession = 0
+var float orHigh = na
+var float orLow  = na
+
+if session.isfirstbar
+    barsIntoSession := 1
+    orHigh := high
+    orLow  := low
+else
+    barsIntoSession := barsIntoSession + 1
+    if barsIntoSession <= openingRangeBars
+        orHigh := math.max(orHigh, high)
+        orLow  := math.min(orLow, low)
+
+orComplete = barsIntoSession > openingRangeBars
+
+// --------------------------------------------------------------------- //
+// VWAP reclaim -- Pine's built-in ta.vwap() is session-anchored, same
+// meaning as scanner.py's _session_vwap() over the bars seen so far.
+// --------------------------------------------------------------------- //
+vwapVal   = ta.vwap(hlc3)
+prevClose = close[1]
+
+// --------------------------------------------------------------------- //
+// ATR proxy -- same formula as scanner.py's _atr_proxy: plain average of
+// bar ranges over `atrLookback` bars (NOT Wilder's ATR).
+// --------------------------------------------------------------------- //
+atrProxy = ta.sma(high - low, atrLookback)
+
+// --------------------------------------------------------------------- //
+// Signals, in the same priority order as scanner.py's scan_ticker(): ORB
+// first, VWAP reclaim only if ORB didn't fire.
+// --------------------------------------------------------------------- //
+orbLongSignal  = orComplete and close > orHigh
+orbShortSignal = orComplete and close < orLow
+orbFired       = orbLongSignal or orbShortSignal
+
+vwapReclaimLong  = not na(vwapVal) and prevClose < vwapVal and close >= vwapVal
+vwapReclaimShort = not na(vwapVal) and prevClose > vwapVal and close <= vwapVal
+
+longSignal  = orbFired ? orbLongSignal  : vwapReclaimLong
+shortSignal = orbFired ? orbShortSignal : vwapReclaimShort
+setupName   = orbFired ? "ORB" : (vwapReclaimLong or vwapReclaimShort ? "VWAP_RECLAIM" : "")
+
+// --------------------------------------------------------------------- //
+// Risk gate -- daily loss limit + max drawdown, same two checks as
+// portfolio.py's can_open() (unclassified-ticker rejection is the third
+// check there; here it's isClassified).
+// --------------------------------------------------------------------- //
+var float dayStartEquity = na
+if session.isfirstbar or na(dayStartEquity)
+    dayStartEquity := strategy.equity
+
+dailyPnlPct       = na(dayStartEquity) or dayStartEquity == 0 ? 0.0 : (strategy.equity - dayStartEquity) / dayStartEquity
+dailyLossLimitHit = dailyPnlPct <= -dailyLossLimitPct
+maxDrawdownHit     = strategy.equity <= startingBalanceInput * (1 - maxDrawdownPct)
+
+canEnterNew = strategy.position_size == 0 and isClassified and not dailyLossLimitHit and
+     not maxDrawdownHit and not na(atrProxy) and atrProxy > 0
+
+// --------------------------------------------------------------------- //
+// Entry -- ATR-sized position, stop/target from stop_k / target_r, exactly
+// scanner.py's `risk = |close - stop|; target = close +/- target_r * risk`.
+// --------------------------------------------------------------------- //
+var float activeStop   = na
+var float activeTarget = na
+var string activeSetup = ""
+
+if canEnterNew and (longSignal or shortSignal)
+    stopDist    = stopK * atrProxy
+    riskDollars = strategy.equity * riskPerTradePct
+    qty         = stopDist > 0 ? riskDollars / stopDist : float(na)
+
+    if not na(qty) and qty > 0
+        if longSignal
+            stopPrice   = close - stopDist
+            riskAmt     = close - stopPrice
+            targetPrice = close + targetR * riskAmt
+            strategy.entry("Long", strategy.long, qty=qty)
+            activeStop   := stopPrice
+            activeTarget := targetPrice
+            activeSetup  := setupName
+        else if shortSignal
+            stopPrice   = close + stopDist
+            riskAmt     = stopPrice - close
+            targetPrice = close - targetR * riskAmt
+            strategy.entry("Short", strategy.short, qty=qty)
+            activeStop   := stopPrice
+            activeTarget := targetPrice
+            activeSetup  := setupName
+
+// --------------------------------------------------------------------- //
+// Exit -- hard stop / R-multiple target, direction-aware.
+// --------------------------------------------------------------------- //
+if strategy.position_size > 0
+    strategy.exit("Exit Long", from_entry="Long", stop=activeStop, limit=activeTarget)
+
+if strategy.position_size < 0
+    strategy.exit("Exit Short", from_entry="Short", stop=activeStop, limit=activeTarget)
+
+// --------------------------------------------------------------------- //
+// Visuals
+// --------------------------------------------------------------------- //
+plot(orComplete ? orHigh : na, title="Opening Range High", color=color.new(color.teal, 0), style=plot.style_stepline)
+plot(orComplete ? orLow : na, title="Opening Range Low", color=color.new(color.maroon, 0), style=plot.style_stepline)
+plot(vwapVal, title="Session VWAP", color=color.new(color.purple, 0))
+
+plotshape(canEnterNew and longSignal, title="Long Signal", style=shape.triangleup,
+     location=location.belowbar, color=color.new(color.green, 0), size=size.small)
+plotshape(canEnterNew and shortSignal, title="Short Signal", style=shape.triangledown,
+     location=location.abovebar, color=color.new(color.red, 0), size=size.small)
+
+bgcolor(not isClassified ? color.new(color.gray, 85) : na, title="Ticker not in the 29-ticker universe")
+bgcolor(isClassified and (dailyLossLimitHit or maxDrawdownHit) ? color.new(color.red, 90) : na, title="Risk limit hit")
+
+var table infoTable = table.new(position.top_right, 2, 6, border_width=1)
+if barstate.islast
+    table.cell(infoTable, 0, 0, "Ticker", text_color=color.white, bgcolor=color.gray)
+    table.cell(infoTable, 1, 0, syminfo.ticker, text_color=color.white, bgcolor=color.gray)
+    table.cell(infoTable, 0, 1, "Group", text_color=color.white, bgcolor=color.gray)
+    table.cell(infoTable, 1, 1, isClassified ? group + " (" + groupName() + ")" : "unclassified",
+         text_color=color.white, bgcolor=color.gray)
+    table.cell(infoTable, 0, 2, "stop_k / target_r", text_color=color.white, bgcolor=color.gray)
+    table.cell(infoTable, 1, 2, str.tostring(stopK, "#.##") + " / " + str.tostring(targetR, "#.##"),
+         text_color=color.white, bgcolor=color.gray)
+    table.cell(infoTable, 0, 3, "Setup / group slot (info only)", text_color=color.white, bgcolor=color.gray)
+    table.cell(infoTable, 1, 3, (activeSetup == "" ? "--" : activeSetup) + " / max " + str.tostring(groupMaxConcurrent()),
+         text_color=color.white, bgcolor=color.gray)
+    table.cell(infoTable, 0, 4, "Daily P&L", text_color=color.white, bgcolor=color.gray)
+    table.cell(infoTable, 1, 4, str.tostring(dailyPnlPct * 100, "#.##") + "%",
+         text_color=dailyPnlPct < 0 ? color.red : color.green, bgcolor=color.gray)
+    table.cell(infoTable, 0, 5, "Risk Limit", text_color=color.white, bgcolor=color.gray)
+    table.cell(infoTable, 1, 5, (dailyLossLimitHit or maxDrawdownHit) ? "HIT -- no new entries" : "OK",
+         text_color=(dailyLossLimitHit or maxDrawdownHit) ? color.red : color.green, bgcolor=color.gray)
+
+alertcondition(canEnterNew and longSignal, title="Archetype ORB/VWAP Long", message="Long entry signal fired")
+alertcondition(canEnterNew and shortSignal, title="Archetype ORB/VWAP Short", message="Short entry signal fired")

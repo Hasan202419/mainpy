@@ -159,3 +159,40 @@ yangi kirishlar to'xtatiladi (ochiq pozitsiya majburan yopilmaydi).
 Bu skript shu muhitda (TradingView'siz) kompilyatsiya qilib ko'rilmadi —
 Pine v6 grammatikasiga diqqat bilan qarab yozilgan, lekin agar Pine
 Editor xato chiqarsa, xato matnini menga yuboring — darhol tuzataman.
+
+## Arxetip-asosli ORB + VWAP reclaim strategiyasi (TradingView)
+
+`archetype_orb_vwap_strategy.pine` — yuqoridagi `buy_only_strategy.pine`dan
+**alohida va farqli** skript: bu safar `archetypes.py` + `scanner.py` +
+`portfolio.py`dagi Python mantiqni **so'zma-so'z** TradingView'ga
+ko'chiradi (o'sha fayllar aynan "29 stock intraday playbook" — Claude
+Opus 5 / Claude Fable 5 hisobotlaridan olingan). Farqi:
+`buy_only_strategy.pine` faqat BUY (long) ochadi; bu skript esa asl Python
+scanner kabi **ham long, ham short** ochadi.
+
+- Grafikka 29 tikerdan istalganini qo'ysangiz (masalan TSLA, AAPL, JNJ),
+  skript `archetypes.py`dagi xaritaga qarab tikerning arxetip guruhini
+  (A–G) avtomatik aniqlaydi va o'sha guruhning `stop_k`/`target_r`sini
+  qo'llaydi — qo'lda ustidan yozib qo'yish ham mumkin.
+- Signal mantig'i `scanner.py` bilan bir xil ustuvorlikda: avval **ORB**
+  (sessiyaning birinchi 6 bari — 5m grafikda 30 daqiqa — dan tashqariga
+  chiqish), keyin **VWAP reclaim** (sessiya VWAP'ining narigi tomoniga
+  o'tib, ushlab turish).
+- Risk: ATR-proksi asosida pozitsiya hajmi (`portfolio.py`dagi
+  `DEFAULT_RISK_PCT`), kunlik 2% zarar limiti va 4% max drawdown'dan
+  keyin yangi kirish to'xtaydi (`can_open()` bilan bir xil), boshlang'ich
+  balans $30,000 (`STARTING_BALANCE`).
+
+**Muhim cheklov:** `archetypes.py`dagi `max_concurrent` (bir guruhdan bir
+vaqtda nechta pozitsiya ochilishi mumkinligi — korrelyatsiya-risk limiti)
+bitta grafikda ishlamaydi, chunki bitta Pine strategiyasi faqat o'zi
+qo'yilgan tikerni ko'radi, boshqa tikerlarda order оча olmaydi. Jadvalda
+guruhning `max_concurrent`i faqat **ma'lumot uchun** ko'rsatiladi — agar
+bir guruhdan bir nechta tikerni parallel savdo qilsangiz, bu limitni
+o'zingiz kuzatishingiz kerak.
+
+Ishga tushirish tartibi xuddi yuqoridagi skript kabi: mos tikerning
+grafigini oching → Pine Editor'ga joylashtiring → Add to Chart → Strategy
+Tester'da natijani ko'ring. Bu ham TradingView'siz sinalmagan — Pine v6
+grammatikasiga diqqat bilan mos yozilgan; kompilyatsiya xatosi chiqsa
+menga yuboring.
