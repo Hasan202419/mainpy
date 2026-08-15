@@ -1,0 +1,183 @@
+// This Pine Script® code is subject to the terms of the Mozilla Public License 2.0 at https://mozilla.org/MPL/2.0/
+// © Hasan202419
+//
+// buy_only_strategy.pine
+// =======================
+// Long-only (buy-only) multi-strategy script, built from the "Comprehensive
+// 'Buy-only' Trading Strategy Analysis" report (SciSpace Research Agent,
+// July 2026). Three selectable modes share one risk-management core:
+//
+//   1. Scalping        -- Mean Reversion (1m, TSLA):  Buy when RSI(14) < 30
+//      (oversold), hold for a short, fixed number of bars (~3-5 min on a
+//      1m chart), then exit.
+//   2. Day Trading      -- SMA Crossover (15m, TSLA): Buy when the fast SMA
+//      (default 8) crosses above the slow SMA (default 21); exit on the
+//      opposite crossover.
+//   3. Swing Trading    -- Golden Cross (Daily, AAPL): Buy when the 50-day
+//      SMA crosses above the 200-day SMA (Golden Cross); exit on a Death
+//      Cross (50 back below 200).
+//
+// Shared risk management (mirrors the paper-trading rules in this repo's
+// portfolio.py -- same 2%-style daily-loss-limit idea, ATR-based stop
+// sizing, and an R-multiple target):
+//   - Hard stop-loss at the PREVIOUS candle's low.
+//   - Position size computed from ATR so every trade risks a fixed % of
+//     equity, not a fixed share count.
+//   - Max daily drawdown limit: once today's equity is down beyond the
+//     limit, NEW entries are blocked for the rest of the day (an already
+//     open position is left to hit its own stop/target -- it is not
+//     force-closed, same philosophy as portfolio.py's can_open() gate).
+//   - Long only. This script never opens a short.
+//
+// Each mode is tuned for a specific ticker/timeframe (see the header of
+// each mode above) -- Pine strategies run on whatever chart you apply them
+// to, so open the matching chart (e.g. TSLA 1m for Scalping, TSLA 15m for
+// Day Trading, AAPL 1D for Swing Trading) before backtesting that mode.
+
+//@version=6
+strategy(
+     title="Buy-only Multi-Strategy (Scalping / Day Trading / Swing)",
+     shorttitle="BuyOnly-3Strat",
+     overlay=true,
+     initial_capital=10000,
+     default_qty_type=strategy.fixed,
+     default_qty_value=1,
+     currency=currency.USD,
+     calc_on_order_fills=false,
+     process_orders_on_close=false)
+
+// --------------------------------------------------------------------- //
+// Inputs
+// --------------------------------------------------------------------- //
+strategyModeInput = input.string(
+     "Scalping (RSI Mean Reversion)", title="Strategy Mode",
+     options=["Scalping (RSI Mean Reversion)", "Day Trading (SMA Crossover)", "Swing Trading (Golden Cross)"],
+     group="Strategy Mode")
+
+rsiLength     = input.int(14, title="RSI Length", minval=1, group="Scalping (1m, TSLA)")
+rsiOversold   = input.float(30.0, title="RSI Oversold Level", group="Scalping (1m, TSLA)")
+scalpHoldBars = input.int(5, title="Max Hold (bars, ~5min on a 1m chart)", minval=1, group="Scalping (1m, TSLA)")
+
+fastSmaLength = input.int(8, title="Fast SMA Length", minval=1, group="Day Trading (15m, TSLA)")
+slowSmaLength = input.int(21, title="Slow SMA Length", minval=1, group="Day Trading (15m, TSLA)")
+
+goldenFastLength = input.int(50, title="Golden Cross Fast SMA", minval=1, group="Swing Trading (Daily, AAPL)")
+goldenSlowLength = input.int(200, title="Golden Cross Slow SMA", minval=1, group="Swing Trading (Daily, AAPL)")
+
+riskPerTradePctInput = input.float(0.5, title="Risk per Trade (% of equity)", minval=0.01, group="Risk Management")
+atrLength             = input.int(14, title="ATR Length", minval=1, group="Risk Management")
+atrStopMult           = input.float(1.0, title="ATR Stop Multiplier", minval=0.1, group="Risk Management")
+rewardRiskScalp        = input.float(1.2, title="Reward:Risk -- Scalping", minval=0.1, group="Risk Management")
+rewardRiskDay           = input.float(1.8, title="Reward:Risk -- Day Trading", minval=0.1, group="Risk Management")
+rewardRiskSwing         = input.float(2.5, title="Reward:Risk -- Swing Trading", minval=0.1, group="Risk Management")
+maxDailyDrawdownPctInput = input.float(2.0, title="Max Daily Drawdown (%)", minval=0.1, group="Risk Management")
+
+riskPerTradePct     = riskPerTradePctInput / 100
+maxDailyDrawdownPct = maxDailyDrawdownPctInput / 100
+
+// --------------------------------------------------------------------- //
+// Indicators
+// --------------------------------------------------------------------- //
+rsiVal         = ta.rsi(close, rsiLength)
+fastSma        = ta.sma(close, fastSmaLength)
+slowSma        = ta.sma(close, slowSmaLength)
+goldenFastSma  = ta.sma(close, goldenFastLength)
+goldenSlowSma  = ta.sma(close, goldenSlowLength)
+atrVal         = ta.atr(atrLength)
+
+isScalping    = strategyModeInput == "Scalping (RSI Mean Reversion)"
+isDayTrading  = strategyModeInput == "Day Trading (SMA Crossover)"
+isSwing       = strategyModeInput == "Swing Trading (Golden Cross)"
+
+// --------------------------------------------------------------------- //
+// Entry / exit signals per mode
+// --------------------------------------------------------------------- //
+scalpEntry = isScalping and ta.crossunder(rsiVal, rsiOversold)
+dayEntry   = isDayTrading and ta.crossover(fastSma, slowSma)
+swingEntry = isSwing and ta.crossover(goldenFastSma, goldenSlowSma)
+
+longCondition = scalpEntry or dayEntry or swingEntry
+
+dayExit   = isDayTrading and ta.crossunder(fastSma, slowSma)
+swingExit = isSwing and ta.crossunder(goldenFastSma, goldenSlowSma)
+
+// --------------------------------------------------------------------- //
+// Daily drawdown tracking -- blocks NEW entries once the daily loss limit
+// is hit, same philosophy as portfolio.py's can_open() daily-loss gate.
+// --------------------------------------------------------------------- //
+var float dayStartEquity = na
+newDay = ta.change(time("D")) != 0
+if newDay or na(dayStartEquity)
+    dayStartEquity := strategy.equity
+
+dailyPnlPct  = na(dayStartEquity) or dayStartEquity == 0 ? 0.0 : (strategy.equity - dayStartEquity) / dayStartEquity
+dailyLimitHit = dailyPnlPct <= -maxDailyDrawdownPct
+
+canEnterNew = strategy.position_size == 0 and not dailyLimitHit and not na(atrVal) and atrVal > 0
+
+// --------------------------------------------------------------------- //
+// Entry: ATR-sized position, stop at previous candle's low, R-multiple
+// target based on the selected mode's reward:risk input.
+// --------------------------------------------------------------------- //
+var float activeStopPrice   = na
+var float activeTargetPrice = na
+var int   entryBarIndex     = na
+
+if longCondition and canEnterNew
+    stopDistance  = atrVal * atrStopMult
+    riskDollars   = strategy.equity * riskPerTradePct
+    qty           = riskDollars / stopDistance
+    rewardRisk    = isScalping ? rewardRiskScalp : isDayTrading ? rewardRiskDay : rewardRiskSwing
+    prevLow       = low[1]
+    // Guard: previous low should sit below the current close; if not
+    // (gap / bad data), fall back to a pure ATR-based stop distance.
+    stopPrice     = prevLow < close ? prevLow : close - stopDistance
+    targetPrice   = close + rewardRisk * (close - stopPrice)
+
+    strategy.entry("Long", strategy.long, qty=qty)
+    activeStopPrice   := stopPrice
+    activeTargetPrice := targetPrice
+    entryBarIndex     := bar_index
+
+// --------------------------------------------------------------------- //
+// Exit: hard stop / R-multiple target always active while in a position,
+// plus each mode's own signal-based exit.
+// --------------------------------------------------------------------- //
+if strategy.position_size > 0
+    strategy.exit("Exit", from_entry="Long", stop=activeStopPrice, limit=activeTargetPrice)
+
+    if isScalping and not na(entryBarIndex) and (bar_index - entryBarIndex) >= scalpHoldBars
+        strategy.close("Long", comment="Time Exit")
+
+    if dayExit
+        strategy.close("Long", comment="SMA Cross Exit")
+
+    if swingExit
+        strategy.close("Long", comment="Death Cross Exit")
+
+// --------------------------------------------------------------------- //
+// Visuals
+// --------------------------------------------------------------------- //
+plot(isDayTrading ? fastSma : na, title="Fast SMA (Day Trading)", color=color.new(color.blue, 0))
+plot(isDayTrading ? slowSma : na, title="Slow SMA (Day Trading)", color=color.new(color.orange, 0))
+plot(isSwing ? goldenFastSma : na, title="Golden Cross Fast SMA (50)", color=color.new(color.lime, 0))
+plot(isSwing ? goldenSlowSma : na, title="Golden Cross Slow SMA (200)", color=color.new(color.red, 0))
+
+plotshape(longCondition and canEnterNew, title="Buy Signal", style=shape.triangleup,
+     location=location.belowbar, color=color.new(color.green, 0), size=size.small)
+
+bgcolor(dailyLimitHit ? color.new(color.red, 90) : na, title="Daily Loss Limit Hit")
+
+var table infoTable = table.new(position.top_right, 2, 3, border_width=1)
+if barstate.islast
+    table.cell(infoTable, 0, 0, "Mode", text_color=color.white, bgcolor=color.gray)
+    table.cell(infoTable, 1, 0, strategyModeInput, text_color=color.white, bgcolor=color.gray)
+    table.cell(infoTable, 0, 1, "Daily P&L", text_color=color.white, bgcolor=color.gray)
+    table.cell(infoTable, 1, 1, str.tostring(dailyPnlPct * 100, "#.##") + "%",
+         text_color=dailyPnlPct < 0 ? color.red : color.green, bgcolor=color.gray)
+    table.cell(infoTable, 0, 2, "Daily Limit", text_color=color.white, bgcolor=color.gray)
+    table.cell(infoTable, 1, 2, dailyLimitHit ? "HIT -- no new entries" : "OK",
+         text_color=dailyLimitHit ? color.red : color.green, bgcolor=color.gray)
+
+alertcondition(longCondition and canEnterNew, title="Buy-only Entry Signal",
+     message="Buy-only strategy: entry signal fired")

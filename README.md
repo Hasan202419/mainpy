@@ -123,3 +123,39 @@ oddiy JSON fayl sifatida shu skriptlarga uzatiladi. Bu "bozor ma'lumotini
 o'qish" (xavfsiz, faqat o'qish) bilan "buyurtma yuborish" o'rtasida qattiq
 devor qo'yadi — real hisobda tugmani bosish har doim odam (Hasan) qo'lida
 qoladi.
+
+## Pine Script strategiyasi (TradingView)
+
+`buy_only_strategy.pine` — "Comprehensive 'Buy-only' Trading Strategy
+Analysis" hisobotidagi 3 ta long-only strategiyani bitta konfiguratsiya-
+lanadigan TradingView `strategy()` skriptiga jamlaydi:
+
+- **Scalping** — RSI(14) < 30 (oversold) da BUY, ~3-5 bar (1m grafikda
+  taxminan 3-5 daqiqa) ushlab chiqish. TSLA 1m grafik uchun mo'ljallangan.
+- **Day Trading** — 8-davrli SMA 21-davrli SMA'dan yuqoriga kesib
+  o'tganda BUY, qarama-qarshi crossover'da chiqish. TSLA 15m grafik uchun.
+- **Swing Trading** — Golden Cross: 50-kunlik SMA 200-kunlik SMA'dan
+  yuqoriga o'tganda BUY, Death Cross'da chiqish. AAPL kunlik (1D) grafik
+  uchun.
+
+Uchala rejim ham bitta umumiy risk-yadrodan foydalanadi (repo'dagi
+`portfolio.py`ning risk-mantig'iga izchil): stop-loss oldingi shamning
+low'ida, pozitsiya hajmi ATR asosida hisoblanadi (har savdo tengdek % risk
+qiladi), va kunlik drawdown limitiga (standart 2%) yetilgach shu kun uchun
+yangi kirishlar to'xtatiladi (ochiq pozitsiya majburan yopilmaydi).
+
+### Ishga tushirish
+
+1. TradingView'da mos grafikni oching (masalan Scalping uchun TSLA, 1m
+   timeframe).
+2. Pine Editor'ni oching (pastki panel) → yangi skript → shu faylning
+   tarkibini joylashtiring → **Add to Chart**.
+3. Skript sozlamalaridan (⚙️) **Strategy Mode**'ni tanlang (Scalping /
+   Day Trading / Swing Trading) — grafikdagi ticker/timeframe'ga mos
+   rejimni tanlash kerak.
+4. Natijalarni **Strategy Tester** panelida (Total Return, Win Rate va h.k.)
+   ko'ring.
+
+Bu skript shu muhitda (TradingView'siz) kompilyatsiya qilib ko'rilmadi —
+Pine v6 grammatikasiga diqqat bilan qarab yozilgan, lekin agar Pine
+Editor xato chiqarsa, xato matnini menga yuboring — darhol tuzataman.
